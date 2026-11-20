@@ -76,7 +76,14 @@ func (e *Etcd) IsNameError(err error) bool {
 
 // Records looks up records in etcd. If exact is true, it will lookup just this
 // name. This is used when find matches when completing SRV lookups for instance.
+//
+// The range call and every lease TTL call made while processing its result share
+// one time budget of etcdTimeout, and none of them outlives ctx. If that budget is
+// used up or ctx is done, Records returns the context error.
 func (e *Etcd) Records(ctx context.Context, state request.Request, exact bool) ([]msg.Service, error) {
+	ctx, cancel := context.WithTimeout(ctx, etcdTimeout)
+	defer cancel()
+
 	name := state.Name()
 
 	path, star := msg.PathWithWildcard(name, e.PathPrefix)
@@ -85,12 +92,10 @@ func (e *Etcd) Records(ctx context.Context, state request.Request, exact bool) (
 		return nil, err
 	}
 	segments := strings.Split(msg.Path(name, e.PathPrefix), "/")
-	return e.loopNodes(r.Kvs, segments, star, state.QType())
+	return e.loopNodes(ctx, r.Kvs, segments, star, state.QType())
 }
 
 func (e *Etcd) get(ctx context.Context, path string, recursive bool) (*etcdcv3.GetResponse, error) {
-	ctx, cancel := context.WithTimeout(ctx, etcdTimeout)
-	defer cancel()
 	if recursive {
 		if !strings.HasSuffix(path, "/") {
 			path = path + "/"
@@ -122,7 +127,7 @@ func (e *Etcd) get(ctx context.Context, path string, recursive bool) (*etcdcv3.G
 	return r, nil
 }
 
-func (e *Etcd) loopNodes(kv []*mvccpb.KeyValue, nameParts []string, star bool, qType uint16) (sx []msg.Service, err error) {
+func (e *Etcd) loopNodes(ctx context.Context, kv []*mvccpb.KeyValue, nameParts []string, star bool, qType uint16) (sx []msg.Service, err error) {
 	bx := make(map[msg.Service]struct{})
 Nodes:
 	for _, n := range kv {
@@ -152,7 +157,11 @@ Nodes:
 		}
 		bx[*serv] = struct{}{}
 
-		serv.TTL = e.TTL(n, serv)
+		ttl, terr := e.ttl(ctx, n, serv)
+		if terr != nil {
+			return nil, terr
+		}
+		serv.TTL = ttl
 		if serv.Priority == 0 {
 			serv.Priority = defaultPriority
 		}
@@ -166,12 +175,41 @@ Nodes:
 
 // TTL returns the smaller of the etcd TTL and the service's
 // TTL. If neither of these are set (have a zero value), a default is used.
+//
+// Any lease lookup it makes is bounded by etcdTimeout. Code that has a request
+// context should use ttl, so the lookup also stops when that context is done.
 func (e *Etcd) TTL(kv *mvccpb.KeyValue, serv *msg.Service) uint32 {
+	ctx, cancel := context.WithTimeout(context.Background(), etcdTimeout)
+	defer cancel()
+
+	ttl, err := e.ttl(ctx, kv, serv)
+	if err != nil {
+		// ctx is done. Keep the long-standing behavior of this method and fall
+		// back to the service TTL, or the default.
+		if serv.TTL != 0 {
+			return serv.TTL
+		}
+		return defaultTTL
+	}
+	return ttl
+}
+
+// ttl is TTL with the lease lookup bound to ctx. It returns an error only when
+// ctx is done; a failed or expired lease with a live ctx falls back as before.
+func (e *Etcd) ttl(ctx context.Context, kv *mvccpb.KeyValue, serv *msg.Service) (uint32, error) {
 	var etcdTTL uint32
 
 	// Get actual lease TTL from etcd if lease exists and client is available
 	if kv.GetLease() != 0 && e.Client != nil {
-		if resp, err := e.Client.TimeToLive(context.Background(), etcdcv3.LeaseID(kv.GetLease())); err == nil && resp.TTL > 0 {
+		// Never start a lease RPC once the request is over.
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		resp, err := e.Client.TimeToLive(ctx, etcdcv3.LeaseID(kv.GetLease()))
+		if err != nil && ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if err == nil && resp.TTL > 0 {
 			leaseTTL := resp.TTL
 
 			// Get bounds with defaults
@@ -199,18 +237,18 @@ func (e *Etcd) TTL(kv *mvccpb.KeyValue, serv *msg.Service) uint32 {
 	}
 
 	if etcdTTL == 0 && serv.TTL == 0 {
-		return defaultTTL
+		return defaultTTL, nil
 	}
 	if etcdTTL == 0 {
-		return serv.TTL
+		return serv.TTL, nil
 	}
 	if serv.TTL == 0 {
-		return etcdTTL
+		return etcdTTL, nil
 	}
 	if etcdTTL < serv.TTL {
-		return etcdTTL
+		return etcdTTL, nil
 	}
-	return serv.TTL
+	return serv.TTL, nil
 }
 
 // shouldInclude returns true if the service should be included in a list of records, given the qType. For all the

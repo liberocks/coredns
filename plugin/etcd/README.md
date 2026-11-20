@@ -97,6 +97,12 @@ find entries like `/skydns/test/skydns/mx1`.
 
 This causes two lookups from CoreDNS to etcd in certain cases.
 
+A record that is backed by an etcd lease causes one more request to etcd, to read the remaining
+lease time. All the requests made for one lookup share a total time limit of 5 seconds, and they
+stop sooner if the DNS request is cancelled or runs out of time. When the limit is reached, the
+query is answered with SERVFAIL. If only the lease request fails while time remains (for example,
+the lease no longer exists), the record's own `ttl` or the default TTL is used instead.
+
 Each etcd service entry is independent. Multiple entries with hostname-valued `host` fields below
 the same owner can therefore produce multiple CNAME records for that owner. Such an RRset is invalid
 DNS; use only one CNAME target per owner. Multiple hostname entries can still be used as SRV targets,
