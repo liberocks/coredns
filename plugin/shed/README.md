@@ -34,6 +34,11 @@ The *shed* plugin makes that panic structurally unreachable, per UDP listener so
 Drops are silent - no response is written, so the client's resolver retries against another
 server, the standard load-shedding contract for UDP DNS. Every drop is counted.
 
+Without *shed*, CoreDNS still caps the writes pending on each UDP socket at 16384 and drops the
+excess responses (counted in `coredns_dns_udp_write_dropped_total`), so the pile-up is bounded but
+much larger than *shed*'s, and queries are still processed before their responses are dropped.
+Use *shed* for real overload protection.
+
 The plugin only acts on UDP; TCP queries pass through untouched. It can only be used in plain DNS
 server blocks (not *tls*, *grpc*, *https* or *quic*), which is enforced at startup. It should be
 listed before (above) the *prometheus* plugin in the plugin chain, so that shed drops are never

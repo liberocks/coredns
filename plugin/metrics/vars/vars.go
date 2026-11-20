@@ -57,6 +57,13 @@ var (
 		Help:      "Counter of response status codes.",
 	}, []string{"server", "zone", "view", "rcode", "plugin"})
 
+	UDPWriteDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: subsystem,
+		Name:      "udp_write_dropped_total",
+		Help:      "Counter of UDP responses dropped because too many writes were already pending on the listener socket.",
+	}, []string{"server"})
+
 	Panic = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Name:      "panics_total",
