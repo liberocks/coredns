@@ -52,7 +52,6 @@ require (
 
 require (
 	github.com/caddyserver/certmagic v0.25.6
-	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/letsencrypt/pebble/v2 v2.10.3
 	github.com/mholt/acmez/v3 v3.1.7
 	github.com/pires/go-proxyproto v0.16.0
