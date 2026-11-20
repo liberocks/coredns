@@ -43,6 +43,13 @@ func setup(c *caddy.Controller) error {
 	if err != nil {
 		return plugin.Error(pluginName, err)
 	}
+	if onShut != nil {
+		// Caddy does not run OnShutdown for a replacement instance that a failed
+		// reload discards after onStart has started the informers. Register the
+		// stop for that case before onStart, and ignore the "already stopping"
+		// error in case the normal shutdown path got there first.
+		dnsserver.OnAbandonedStart(c, func() error { _ = onShut(); return nil })
+	}
 	if onStart != nil {
 		c.OnStartup(onStart)
 	}
