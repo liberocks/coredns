@@ -151,6 +151,7 @@ use the `%servername` endpoint form when upstreams in the same stanza require di
 On each endpoint, the timeouts for communication are set as follows:
 
 * The DNS and DoT dial timeout defaults to 30s and can decrease automatically down to 1s based on early results.
+  It never extends past the 5s forwarding retry window or an earlier request deadline.
   The DoQ handshake timeout is 5s.
 * DoT connection setup (TCP dial plus TLS handshake) is additionally bounded by the remaining
   5s forwarding retry window, or an earlier request deadline. When retries are enabled, each
@@ -158,7 +159,9 @@ On each endpoint, the timeouts for communication are set as follows:
   2.5s), so a stalled handshake leaves time to try a fresh connection. With `max_connect_attempts 1`,
   setup may use the full remaining window. Failed handshakes close the connection; successful
   connections remain reusable. These setup limits do not change the DNS exchange read timeout.
-* The read timeout is static at 2s.
+* The read timeout is static at 2s (see `read_timeout`). It is capped by the remaining 5s forwarding
+  retry window and by an earlier request deadline, and a request that is cancelled stops waiting for
+  the upstream immediately.
 
 ## Metadata
 

@@ -196,12 +196,17 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		)
 		opts := f.opts
 
+		// Bound every exchange with this attempt by the retry window as well as the
+		// caller's context, so a dial, write or read cannot outlive the window.
+		// ctx itself is left alone: it is also handed to the next plugin.
+		connectCtx, cancelConnect := context.WithDeadline(ctx, deadline)
+
 		for {
 			opts.TLSConnectDeadline = time.Now().Add(tlsConnectTimeout)
 			if opts.TLSConnectDeadline.After(tlsDeadline) {
 				opts.TLSConnectDeadline = tlsDeadline
 			}
-			ret, localAddr, upstreamProto, err = proxy.Connect(ctx, state, opts)
+			ret, localAddr, upstreamProto, err = proxy.Connect(connectCtx, state, opts)
 
 			if err == proxyPkg.ErrCachedClosed { // The peer closed a cached TCP or QUIC connection before the query was sent.
 				continue
@@ -213,6 +218,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			}
 			break
 		}
+		cancelConnect()
 
 		if child != nil {
 			child.Finish()
