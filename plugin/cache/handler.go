@@ -67,7 +67,8 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			trackRefresh := failureRecheck > 0 || c.verifyStaleTimeout > 0
 			if !trackRefresh || i.beginRefresh(now, failureRecheck) {
 				refreshState := authenticatedRefreshState(state)
-				crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: refreshState, server: server, do: do, ad: ad, cd: cd}
+				crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: refreshState, server: server, do: do, ad: ad, cd: cd,
+					nexcept: c.nexcept, pexcept: c.pexcept}
 				if c.verifyStaleTimeout > 0 {
 					// Background verify: cache the response but do not write to the wire.
 					// On timeout, we serve the stale entry below and let the goroutine continue.

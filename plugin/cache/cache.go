@@ -373,6 +373,8 @@ func newPrefetchResponseWriter(server string, req *dns.Msg, do, cd bool, c *Cach
 		ad:         true,
 		prefetch:   true,
 		remoteAddr: prefetchAddr,
+		nexcept:    c.nexcept,
+		pexcept:    c.pexcept,
 	}
 	cw.state = request.Request{Req: req}
 	return cw
