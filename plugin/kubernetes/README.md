@@ -62,10 +62,12 @@ kubernetes [ZONES...] {
    This option is ignored if omitted. The cluster address in the `kubeconfig` is given preference.
 * `apiserver_qps` **QPS** sets the maximum queries per second (QPS) rate limit for requests.
    This allows you to control the rate at which the plugin sends requests to the API server to prevent overwhelming it.
+   If `apiserver_qps` is set and `apiserver_burst` is not, the burst is 10.
 * `apiserver_burst` **BURST** sets the maximum burst size for requests.
    This allows temporary spikes in request rate up to this value, even if it exceeds the QPS limit.
 * `apiserver_max_inflight` **MAX** sets the maximum number of concurrent in-flight requests.
-   This caps the total number of simultaneous requests the plugin can make to the API server.
+   The limit applies to each API client separately: there is one client, plus a second one when `multicluster` is used.
+   A request counts as in flight until its response headers arrive, so a long-running watch stops counting once it has started.
 * `namespaces` **NAMESPACE [NAMESPACE...]** only exposes the k8s namespaces listed.
    If this option is omitted all namespaces are exposed
 * `namespace_labels` **EXPRESSION** only expose the records for Kubernetes namespaces that match this label selector.
