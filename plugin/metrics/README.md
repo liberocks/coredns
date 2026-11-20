@@ -22,6 +22,7 @@ the following metrics are exported:
 * `coredns_dns_responses_total{server, zone, view, rcode, plugin}` - response per zone, rcode and plugin.
 * `coredns_dns_https_responses_total{server, status}` - responses per server and http status code.
 * `coredns_dns_quic_responses_total{server, status}` - responses per server and QUIC application code.
+* `coredns_dns_udp_write_dropped_total{server}` - UDP responses dropped because too many writes were already pending on the listener socket. This only happens when writing to the socket has stalled; it should stay at zero.
 * `coredns_plugin_enabled{server, zone, view, name}` - indicates whether a plugin is enabled on per server, zone and view basis.
 
 Almost each counter has a label `zone` which is the zonename used for the request/response.

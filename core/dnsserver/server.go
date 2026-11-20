@@ -103,6 +103,9 @@ type Server struct {
 	// several server blocks share a listener. See Config.UDPDecorateWriterFunc.
 	udpDecorateWriterFunc func(*Server) dns.DecorateWriter
 
+	// udpMaxPendingWrites overrides defaultMaxPendingUDPWrites; tests only.
+	udpMaxPendingWrites int
+
 	// Ensure Stop is idempotent when invoked concurrently (e.g., during reload and SIGTERM).
 	stopOnce sync.Once
 	stopErr  error
@@ -246,6 +249,12 @@ func (s *Server) ServePacket(p net.PacketConn) error {
 	if s.udpDecorateWriterFunc != nil {
 		dw = s.udpDecorateWriterFunc(s)
 	}
+	// Outermost, so it also bounds handlers calling a decorator that blocks.
+	limit := s.udpMaxPendingWrites
+	if limit <= 0 {
+		limit = defaultMaxPendingUDPWrites
+	}
+	dw = guardUDPWrites(dw, limit, vars.UDPWriteDropped.WithLabelValues(s.Address()))
 	s.m.Lock()
 	s.server[udp] = &dns.Server{PacketConn: p, Net: "udp", Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		ctx := context.WithValue(context.Background(), Key{}, s)

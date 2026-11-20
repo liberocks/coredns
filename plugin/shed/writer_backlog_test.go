@@ -20,6 +20,10 @@ package shed
 //     ServeDNS. One writer, a bounded queue, handlers return, drops counted.
 //   - TestStalledWriteControls: conditions under which there is no pile-up.
 //
+// These tests use dns.Server directly, so they model the DNS library's own
+// behavior. core/dnsserver's ServePacket additionally bounds pending writes per
+// socket (udp_writeguard.go) as a last resort; its tests live in that package.
+//
 // Every scenario logs one "EVIDENCE" line so the numbers can be collected with
 // `go test -v -run ... | grep EVIDENCE`. Scale is 20k datagrams by default and
 // 200k under SHED_FLOOD_TEST=1.
