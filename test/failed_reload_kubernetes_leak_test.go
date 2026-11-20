@@ -2,8 +2,8 @@ package test
 
 // Finding 04: does a failed reload leave Kubernetes informers running?
 //
-// This is the end-to-end counterpart of plugin/reload/failed_restart_lifecycle_test.go.
-// Nothing about CoreDNS or Caddy is faked here except the Kubernetes API server:
+// This is the end-to-end counterpart of core/dnsserver/abandoned_test.go and
+// core/dnsserver/caddy_failed_restart_test.go. Nothing about CoreDNS or Caddy is faked here except the Kubernetes API server:
 //
 //   - the real `dns` server type, the real `kubernetes` plugin and its real
 //     client-go informers;
@@ -20,9 +20,12 @@ package test
 //
 // Each scenario runs in a child process: the Kubernetes plugin installs a
 // process-global klog logger and goroutine/heap counts must not include other
-// tests' informers. The tests assert what CoreDNS does TODAY, so
-// "TestFailedReloadKubernetesLeak/failed-late" passes because the defect is
-// present; flip its expectations if the lifecycle is fixed.
+// tests' informers.
+//
+// Every scenario must end with exactly one controller's worth of watches for the
+// live instance and none once it is shut down. Before the fix, failed-late left
+// one extra controller per failed attempt (3 more watches, 3 more reflector
+// goroutines and several MiB of live heap each) and nothing could stop them.
 //
 // Run (without -race):
 //
@@ -355,6 +358,7 @@ func runLeakScenario(t *testing.T, scenario string) {
 	}
 
 	var lastErr error
+	var afterFirst leakSample
 	for i := 1; i <= leakReloadTries; i++ {
 		next, err := cur.Restart(NewInput(replacement))
 		lastErr = err
@@ -372,8 +376,14 @@ func runLeakScenario(t *testing.T, scenario string) {
 				t.Fatalf("failed restart must return the original instance")
 			}
 		}
+		// A discarded replacement's informers stop asynchronously; give the
+		// API server time to see its watch connections close.
+		waitForWatches(api, perController, 10*time.Second)
 		s := takeLeakSample(api, fmt.Sprintf("after reload attempt %d (%s)", i, scenario))
 		t.Log(s)
+		if i == 1 {
+			afterFirst = s
+		}
 	}
 	if scenario != "successful-control" {
 		t.Logf("EVIDENCE restart error: %v", lastErr)
@@ -401,39 +411,29 @@ func runLeakScenario(t *testing.T, scenario string) {
 		t.Errorf("only %d new watch requests after the disconnect, want at least %d", newReqs, final.watches)
 	}
 
-	switch scenario {
-	case "failed-late":
-		want := perController * (1 + leakReloadTries)
-		// DEFECT assertions: the live instance is still the original, yet the
-		// API server holds a full set of watches per failed attempt.
-		if final.watches != want || final.dnsControls != 1+leakReloadTries {
-			t.Errorf("leak not reproduced as expected: watches=%d (want %d), controllers=%d (want %d); contract after a fix: %d / 1",
-				final.watches, want, final.dnsControls, 1+leakReloadTries, perController)
-		}
-		if after.watches != want {
-			t.Errorf("leaked informers did not reconnect: %d watches, want %d", after.watches, want)
-		}
-		if final.heapMiB < baseline.heapMiB*1.5 {
-			t.Errorf("expected retained informer state in the live heap: baseline %.1f MiB, settled %.1f MiB", baseline.heapMiB, final.heapMiB)
-		}
-		// Shut the live instance down completely. The leaked informers have no
-		// owner, so nothing can stop them; the API server keeps seeing watches.
-		shutdownLive()
-		time.Sleep(500 * time.Millisecond)
-		orphaned, _ := api.active()
-		t.Logf("EVIDENCE after full shutdown of the only registered instance, the API server still sees %d open watches (%d leaked controllers)",
-			orphaned, leakReloadTries)
-		if orphaned != perController*leakReloadTries {
-			t.Errorf("orphaned watches = %d, want %d", orphaned, perController*leakReloadTries)
-		}
-	default:
-		// Controls: exactly one controller's worth of watches, flat goroutines.
-		if final.watches != perController || final.dnsControls != 1 || after.watches != perController {
-			t.Errorf("control scenario %s left extra controllers: watches=%d (want %d), controllers=%d (want 1)",
-				scenario, final.watches, perController, final.dnsControls)
-		}
-		if final.goroutines > baseline.goroutines+10 {
-			t.Errorf("goroutines grew in control: baseline %d, settled %d", baseline.goroutines, final.goroutines)
-		}
+	// The live instance must own exactly one controller, however the attempts
+	// ended. Before the fix failed-late failed here.
+	if final.watches != perController || final.dnsControls != 1 || after.watches != perController {
+		t.Errorf("scenario %s left extra controllers: watches=%d (want %d), controllers=%d (want 1), watches after reconnect=%d",
+			scenario, final.watches, perController, final.dnsControls, after.watches)
+	}
+	if final.goroutines > baseline.goroutines+10 {
+		t.Errorf("goroutines grew: baseline %d, settled %d", baseline.goroutines, final.goroutines)
+	}
+	// Caddy keeps a stale pointer to the last discarded instance in its instance
+	// slice until the next append, which holds about one controller's worth of
+	// heap after a failed reload. That is bounded, so compare with the heap after
+	// the first attempt. A leak adds several MiB per attempt.
+	if final.heapMiB > afterFirst.heapMiB+2 {
+		t.Errorf("live heap kept growing across attempts: %.1f MiB after the first, %.1f MiB after %d", afterFirst.heapMiB, final.heapMiB, leakReloadTries)
+	}
+
+	// Shut the live instance down completely, the way coremain does on exit.
+	// Nothing may be left watching the API.
+	shutdownLive()
+	left := waitForWatches(api, 0, 10*time.Second)
+	t.Logf("EVIDENCE after full shutdown the API server sees %d open watches", left)
+	if left != 0 {
+		t.Errorf("%d watches still open after shutting down the only instance", left)
 	}
 }

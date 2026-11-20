@@ -50,7 +50,11 @@ var registerServerType = sync.OnceValue(func() error {
 	return nil
 })
 
-func newContext(_i *caddy.Instance) caddy.Context {
+func newContext(inst *caddy.Instance) caddy.Context {
+	if inst != nil {
+		// Runs when a restart of this instance fails; see OnAbandonedStart.
+		inst.OnRestartFailed = append(inst.OnRestartFailed, stopAbandonedStarts)
+	}
 	return &dnsContext{keysToConfigs: make(map[string]*Config)}
 }
 
