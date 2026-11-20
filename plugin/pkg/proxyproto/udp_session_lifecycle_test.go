@@ -1,15 +1,15 @@
 package proxyproto
 
-// Lifecycle fixture for the UDP session cache (finding 05).
+// Lifecycle fixture for the UDP session cache.
 //
-// The tests in this file are deliberately NOT parallel: they count goroutines
-// process-wide and take a baseline first, because other tests in this package
-// create session caches that can never be stopped (that is the subject here).
+// A session cache must not outlive the PacketConn that created it. The previous
+// implementation used golang-lru/v2 expirable.LRU (v2.0.7), whose cleanup
+// goroutine can never be stopped and keeps the cache reachable forever, so a
+// closed listener left a worker and its cache behind.
 //
-// TestRepro* tests assert the behaviour observed at the pinned dependency
-// (golang-lru/v2 v2.0.7). TestSessionCacheWorkerStopsOnClose asserts the
-// contract a fix must satisfy; it is skipped unless PROXYPROTO_LIFECYCLE_CONTRACT=1
-// because it fails today.
+// These tests count goroutines process-wide, so they are deliberately NOT
+// parallel and take a baseline first. lruWorkers() looks for that dependency's
+// worker symbol and guards against it (or any cache like it) coming back.
 
 import (
 	"bytes"
@@ -25,7 +25,6 @@ import (
 	"time"
 	"weak"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	proxyproto "github.com/pires/go-proxyproto"
 )
 
@@ -101,8 +100,8 @@ func (f *fakePacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakePacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 // ppv2Datagram builds a PROXY v2 UDP/IPv4 header for src followed by payload.
-func ppv2Datagram(t testing.TB, src *net.UDPAddr, payload []byte) []byte {
-	t.Helper()
+func ppv2Datagram(tb testing.TB, src *net.UDPAddr, payload []byte) []byte {
+	tb.Helper()
 	h := &proxyproto.Header{
 		Version:           2,
 		Command:           proxyproto.PROXY,
@@ -112,7 +111,7 @@ func ppv2Datagram(t testing.TB, src *net.UDPAddr, payload []byte) []byte {
 	}
 	b, err := h.Format()
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return append(b, payload...)
 }
@@ -122,19 +121,19 @@ func useAll(proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) { return pr
 // serveOneSession pushes one ordinary tracked datagram (PPv2 header + payload
 // from a Spectrum-side remote address) through ReadFrom, which lazily creates
 // the session cache on the first eligible session.
-func serveOneSession(t testing.TB, pc *PacketConn, fake *fakePacketConn, remote, client *net.UDPAddr) {
-	t.Helper()
-	fake.push(ppv2Datagram(t, client, []byte("dns-payload")), remote)
+func serveOneSession(tb testing.TB, pc *PacketConn, fake *fakePacketConn, remote, client *net.UDPAddr) {
+	tb.Helper()
+	fake.push(ppv2Datagram(tb, client, []byte("dns-payload")), remote)
 	buf := make([]byte, 512)
 	n, addr, err := pc.ReadFrom(buf)
 	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
+		tb.Fatalf("ReadFrom: %v", err)
 	}
 	if string(buf[:n]) != "dns-payload" {
-		t.Fatalf("payload = %q", buf[:n])
+		tb.Fatalf("payload = %q", buf[:n])
 	}
 	if got := addr.String(); got != client.String() {
-		t.Fatalf("addr = %s, want real client %s", got, client)
+		tb.Fatalf("addr = %s, want real client %s", got, client)
 	}
 }
 
@@ -143,33 +142,33 @@ func newTracked(ttl time.Duration) (*PacketConn, *fakePacketConn) {
 	return &PacketConn{PacketConn: fake, ConnPolicy: useAll, UDPSessionTrackingTTL: ttl}, fake
 }
 
-// Close reaches only the embedded connection: the wrapper has no Close of its
-// own, no File() (so Caddy cannot hand it across a reload), and no cache hook.
-func TestReproWrapperMethodSet(t *testing.T) {
+// The wrapper has no File(), so caddy cannot hand it to the next instance on a
+// reload: every reload creates a new wrapper and therefore a new session table.
+func TestWrapperMethodSet(t *testing.T) {
 	var pc any = &PacketConn{}
 	if _, ok := pc.(interface{ File() (*os.File, error) }); ok {
-		t.Fatal("PacketConn unexpectedly has File(); Caddy could reuse it across reload")
-	}
-	if _, ok := pc.(interface{ CloseSessions() }); ok {
-		t.Fatal("unexpected session cleanup hook")
+		t.Fatal("PacketConn unexpectedly has File(); caddy could reuse it across reload")
 	}
 }
 
-// Lazy start: nothing is started by constructing or closing the wrapper; the
-// worker starts on the first eligible session, and Close does not stop it.
-func TestReproWorkerSurvivesClose(t *testing.T) {
+// The first eligible session creates the table lazily, starts no worker, and
+// Close leaves nothing reachable: once the wrapper is dropped the table is
+// collected. Before the fix a worker kept it alive forever.
+func TestSessionCacheReleasedWithConn(t *testing.T) {
 	base := lruWorkers()
 	pc, fake := newTracked(200 * time.Millisecond)
-
-	if got := lruWorkers(); got != base {
-		t.Fatalf("workers after construction = +%d, want +0 (lazy start)", got-base)
+	if pc.sessionCache != nil {
+		t.Fatal("cache created before any session")
 	}
 
 	serveOneSession(t, pc, fake, udpAddr("10.0.0.1", 5000), udpAddr("198.51.100.7", 40000))
-	if got := lruWorkers() - base; got != 1 {
-		t.Fatalf("workers after first tracked session = %d, want 1", got)
+	if got := lruWorkers() - base; got != 0 {
+		t.Fatalf("workers after first tracked session = +%d, want +0", got)
 	}
-	cache := weak.Make(pc.sessionCache)
+	if pc.sessionCache == nil || pc.sessionCache.Len() != 1 {
+		t.Fatal("expected one tracked session")
+	}
+	table := weak.Make(pc.sessionCache)
 
 	if err := pc.Close(); err != nil {
 		t.Fatal(err)
@@ -178,53 +177,24 @@ func TestReproWorkerSurvivesClose(t *testing.T) {
 		t.Fatalf("underlying Close calls = %d, want 1", fake.closes.Load())
 	}
 
-	// Drop every reference we hold, wait several TTLs (entries expire), GC.
-	pc, fake = nil, nil
 	time.Sleep(3 * 200 * time.Millisecond)
 	settle()
-
-	if got := lruWorkers() - base; got != 1 {
-		t.Fatalf("workers after Close+GC+3xTTL = %d, want 1 (worker survives)", got)
-	}
-	lru := cache.Value()
-	if lru == nil {
-		t.Fatal("session cache was collected; expected the worker to keep it reachable")
-	}
-	if n := lru.Len(); n != 0 {
-		t.Fatalf("entries after expiry = %d, want 0 (entries expire; only the container leaks)", n)
-	}
-	t.Logf("after Close, GC and 3xTTL: workers=+%d, cache still reachable, entries=%d", lruWorkers()-base, lru.Len())
-}
-
-// Control for the weak-pointer technique: an expirable.LRU WITHOUT a worker
-// (ttl 0) is collected once unreferenced, so reachability above is attributable
-// to the worker and not to the measurement.
-func TestReproControlLRUWithoutWorkerIsCollected(t *testing.T) {
-	base := lruWorkers()
-	lru := expirable.NewLRU[string, int](10, nil, 0)
-	lru.Add("k", 1)
-	w := weak.Make(lru)
 	if got := lruWorkers() - base; got != 0 {
-		t.Fatalf("ttl=0 LRU started %d workers, want 0", got)
+		t.Fatalf("workers after Close+GC = +%d, want +0", got)
 	}
-	lru = nil
-	settle()
-	if w.Value() != nil {
-		t.Fatal("worker-less LRU was not collected; weak-pointer technique is unreliable")
+	if table.Value() != nil {
+		t.Fatal("session table still reachable after its PacketConn was closed and dropped")
 	}
 }
 
 // Close before any session is a no-op for the cache: nothing was started.
-func TestReproCloseBeforeInit(t *testing.T) {
+func TestCloseBeforeInit(t *testing.T) {
 	base := lruWorkers()
 	pc, fake := newTracked(time.Second)
 	if err := pc.Close(); err != nil {
 		t.Fatal(err)
 	}
 	settle()
-	if got := lruWorkers() - base; got != 0 {
-		t.Fatalf("workers after Close before init = %d, want 0", got)
-	}
 	if pc.sessionCache != nil {
 		t.Fatal("cache created without a session")
 	}
@@ -235,184 +205,173 @@ func TestReproCloseBeforeInit(t *testing.T) {
 		t.Fatalf("underlying Close calls = %d", fake.closes.Load())
 	}
 	if got := lruWorkers() - base; got != 0 {
-		t.Fatalf("a closed, never-initialised wrapper must not start a worker, got %d", got)
+		t.Fatalf("workers = +%d, want +0", got)
 	}
 }
 
-// Set-aside conditions: no worker without tracking, and none for a header that
-// does not create a session (LOCAL command).
-func TestReproNoWorkerWhenIneligible(t *testing.T) {
-	base := lruWorkers()
-
-	// Tracking disabled (TTL 0): header traffic never touches the cache.
+// No table is created without tracking, or for traffic that carries no header.
+func TestNoSessionCacheWhenIneligible(t *testing.T) {
 	fake := newFakePacketConn()
 	off := &PacketConn{PacketConn: fake, ConnPolicy: useAll}
 	serveOneSession(t, off, fake, udpAddr("10.0.0.1", 5000), udpAddr("198.51.100.7", 40000))
 	off.Close()
+	if off.sessionCache != nil {
+		t.Fatal("cache created with tracking disabled")
+	}
 
-	// Tracking enabled but only headerless traffic: lookupSession never creates.
 	pc, fake2 := newTracked(time.Second)
 	fake2.push([]byte("no-header-payload"), udpAddr("10.0.0.2", 5001))
 	if _, _, err := pc.ReadFrom(make([]byte, 64)); err != nil {
 		t.Fatal(err)
 	}
 	pc.Close()
-
-	settle()
-	if got := lruWorkers() - base; got != 0 {
-		t.Fatalf("ineligible traffic started %d workers, want 0", got)
+	if pc.sessionCache != nil {
+		t.Fatal("headerless traffic created a cache")
 	}
 }
 
-// Two sequential wrappers (a listener replacement): each owns its own session
-// state and its own never-ending worker.
-func TestReproSequentialWrappersAccumulateWorkers(t *testing.T) {
+// Two sequential wrappers (a listener replacement): each has its own session
+// state, no worker exists at any point, and after both are closed and dropped
+// nothing of either is reachable.
+func TestSequentialWrappersLeaveNothingBehind(t *testing.T) {
 	const n = 5
 	base := lruWorkers()
-	var caches []weak.Pointer[expirable.LRU[string, *proxyproto.Header]]
-	var firstRemote = udpAddr("10.0.0.1", 5000)
+	tables := make([]weak.Pointer[sessionTable], 0, n)
+	firstRemote := udpAddr("10.0.0.1", 5000)
 
 	for i := range n {
 		pc, fake := newTracked(time.Minute)
 		serveOneSession(t, pc, fake, udpAddr("10.0.0.1", 5000+i), udpAddr("198.51.100.7", 40000+i))
-		caches = append(caches, weak.Make(pc.sessionCache))
+		tables = append(tables, weak.Make(pc.sessionCache))
 		if i == 1 {
-			// Session state is per wrapper: wrapper 1 must not see wrapper 0's session.
 			if _, ok := pc.lookupSession(firstRemote); ok {
 				t.Fatal("second wrapper observed the first wrapper's session")
 			}
 		}
 		pc.Close()
-		if got := lruWorkers() - base; got != i+1 {
-			t.Fatalf("after wrapper %d closed: workers=+%d, want +%d", i, got, i+1)
+		if got := lruWorkers() - base; got != 0 {
+			t.Fatalf("after wrapper %d closed: workers=+%d, want +0", i, got)
 		}
 	}
 	settle()
-	if got := lruWorkers() - base; got != n {
-		t.Fatalf("after all %d wrappers closed: workers=+%d, want +%d (none exit)", n, got, n)
-	}
-	for i, c := range caches {
-		if c.Value() == nil {
-			t.Fatalf("cache %d collected", i)
+	for i, w := range tables {
+		if w.Value() != nil {
+			t.Fatalf("session table %d still reachable after close", i)
 		}
 	}
-	t.Logf("%d sequential wrappers closed -> %d surviving workers (expected 0 after a fix)", n, lruWorkers()-base)
 }
 
-// Retained size: measure what one leaked, empty (post-expiry) cache costs, and
-// attribute live heap to the CoreDNS allocation site via the heap profile.
-func TestReproRetainedBytesPerLeakedCache(t *testing.T) {
+// Entries expire without any background worker: expiry is applied on access.
+func TestSessionExpiresWithoutWorker(t *testing.T) {
+	base := lruWorkers()
+	ttl := 50 * time.Millisecond
+	pc := newTestPacketConn(ttl, 0)
+	for i := range 20 {
+		pc.storeSession(udpAddr("10.0.0.1", 7000+i), testHeader(udpAddr("198.51.100.8", 50000+i)))
+	}
+	if got := pc.sessionCache.Len(); got != 20 {
+		t.Fatalf("Len = %d, want 20", got)
+	}
+	time.Sleep(3 * ttl)
+	if got := pc.sessionCache.Len(); got != 0 {
+		t.Fatalf("Len after expiry = %d, want 0", got)
+	}
+	if _, ok := pc.lookupSession(udpAddr("10.0.0.1", 7000)); ok {
+		t.Fatal("expired session was returned")
+	}
+	if got := lruWorkers() - base; got != 0 {
+		t.Fatalf("workers = +%d, want +0", got)
+	}
+}
+
+// A lookup refreshes only the touched session; the others still expire on time.
+func TestSessionRefreshKeepsOrdering(t *testing.T) {
+	ttl := 120 * time.Millisecond
+	pc := newTestPacketConn(ttl, 0)
+	a, b := udpAddr("10.0.0.1", 1), udpAddr("10.0.0.1", 2)
+	pc.storeSession(a, testHeader(udpAddr("198.51.100.1", 1)))
+	pc.storeSession(b, testHeader(udpAddr("198.51.100.2", 2)))
+	for range 4 { // keep a alive past 2x ttl
+		time.Sleep(ttl / 3)
+		if _, ok := pc.lookupSession(a); !ok {
+			t.Fatal("refreshed session expired early")
+		}
+	}
+	if _, ok := pc.lookupSession(b); ok {
+		t.Fatal("untouched session did not expire")
+	}
+}
+
+// The table is safe for concurrent use and never exceeds its capacity.
+func TestSessionTableConcurrentBounded(t *testing.T) {
+	pc := newTestPacketConn(time.Second, 64)
+	pc.ensureSessionCache()
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			for i := range 2000 {
+				r := udpAddr("10.0.0.1", 1000+(g*2000+i)%500)
+				pc.storeSession(r, testHeader(udpAddr("198.51.100.9", 1)))
+				pc.lookupSession(r)
+			}
+		})
+	}
+	wg.Wait()
+	if got := pc.sessionCache.Len(); got > 64 {
+		t.Fatalf("Len = %d exceeds capacity 64", got)
+	}
+}
+
+// Retention after close: with the reproduction in the previous commit each
+// closed wrapper kept ~8 KB of heap (plus a goroutine) alive. Now the heap
+// profile must show essentially no live bytes allocated by newSessionTable.
+func TestNoRetainedBytesAfterClose(t *testing.T) {
 	const (
 		n        = 200
 		sessions = 50
-		ttl      = 100 * time.Millisecond
 	)
 	prev := runtime.MemProfileRate
 	runtime.MemProfileRate = 1
 	defer func() { runtime.MemProfileRate = prev }()
 
-	readMem := func() runtime.MemStats {
-		settle()
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		return m
-	}
 	base := lruWorkers()
-	before := readMem()
-
 	for i := range n {
-		pc, fake := newTracked(ttl)
+		pc, fake := newTracked(time.Minute)
 		serveOneSession(t, pc, fake, udpAddr("10.0.0.1", 6000), udpAddr("198.51.100.7", 40000))
 		for j := range sessions {
 			pc.storeSession(udpAddr("10.1.0.1", 10000+j), testHeader(udpAddr("198.51.100.8", 50000+i)))
 		}
 		pc.Close()
 	}
-	live := readMem() // entries still present (<= ttl old)
-	time.Sleep(4 * ttl)
-	expired := readMem()
+	settle()
+	runtime.GC()
+	runtime.GC()
 
-	if got := lruWorkers() - base; got != n {
-		t.Fatalf("workers=+%d, want +%d", got, n)
+	if got := lruWorkers() - base; got != 0 {
+		t.Fatalf("workers = +%d, want +0", got)
 	}
-	per := func(a, b uint64) float64 { return (float64(a) - float64(b)) / n }
-	t.Logf("n=%d leaked caches, %d sessions each, ttl=%s", n, sessions, ttl)
-	t.Logf("  heap/cache with entries   : %.0f B", per(live.HeapAlloc, before.HeapAlloc))
-	t.Logf("  heap/cache after expiry   : %.0f B  (retained container)", per(expired.HeapAlloc, before.HeapAlloc))
-	t.Logf("  goroutine stack/cache     : %.0f B", per(expired.StackInuse, before.StackInuse))
-
-	// Heap profile: in-use bytes whose allocation stack passes through
-	// CoreDNS's ensureSessionCache -> expirable.NewLRU.
-	runtime.GC()
-	runtime.GC()
-	recs := make([]runtime.MemProfileRecord, 4096)
+	recs := make([]runtime.MemProfileRecord, 8192)
 	cnt, ok := runtime.MemProfile(recs, true)
 	if !ok {
 		t.Fatalf("MemProfile buffer too small (%d)", cnt)
 	}
 	var inuse int64
 	for _, r := range recs[:cnt] {
-		var viaCoreDNS, viaNewLRU bool
 		frames := runtime.CallersFrames(r.Stack())
 		for {
 			f, more := frames.Next()
-			viaCoreDNS = viaCoreDNS || strings.Contains(f.Function, "proxyproto.(*PacketConn).ensureSessionCache")
-			viaNewLRU = viaNewLRU || strings.Contains(f.Function, "expirable.NewLRU")
+			if strings.Contains(f.Function, "proxyproto.newSessionTable") {
+				inuse += r.InUseBytes()
+				break
+			}
 			if !more {
 				break
 			}
 		}
-		if viaCoreDNS && viaNewLRU {
-			inuse += r.InUseBytes()
-		}
 	}
-	// The profile covers every cache this test binary leaked (earlier tests too).
-	t.Logf("  heap profile in-use via ensureSessionCache->NewLRU: %d B across %d live workers (%.0f B/worker)",
-		inuse, lruWorkers(), float64(inuse)/float64(lruWorkers()))
-	if inuse <= 0 {
-		t.Fatal("heap profile shows no live bytes attributable to ensureSessionCache->NewLRU")
-	}
-}
-
-// ---- Contract a fix must meet (fails today; skipped by default) -------------
-
-// TestSessionCacheWorkerStopsOnClose states the lifecycle contract from the task:
-// closing a wrapper must stop its worker; the next wrapper has independent
-// state; after closing both the active worker count is back to the baseline.
-func TestSessionCacheWorkerStopsOnClose(t *testing.T) {
-	if os.Getenv("PROXYPROTO_LIFECYCLE_CONTRACT") != "1" {
-		t.Skip("contract test; fails until the session cache is released on Close (set PROXYPROTO_LIFECYCLE_CONTRACT=1)")
-	}
-	base := lruWorkers()
-
-	a, fa := newTracked(time.Minute)
-	serveOneSession(t, a, fa, udpAddr("10.0.0.1", 5000), udpAddr("198.51.100.7", 40000))
-	a.Close()
-	waitWorkers(t, base, "after first wrapper closed")
-
-	b, fb := newTracked(time.Minute)
-	serveOneSession(t, b, fb, udpAddr("10.0.0.1", 5001), udpAddr("198.51.100.7", 40001))
-	if _, ok := b.lookupSession(udpAddr("10.0.0.1", 5000)); ok {
-		t.Fatal("second wrapper observed the first wrapper's session")
-	}
-	if got := lruWorkers() - base; got != 1 {
-		t.Fatalf("workers with one live wrapper = %d, want 1", got)
-	}
-	b.Close()
-	waitWorkers(t, base, "after both wrappers closed")
-}
-
-func waitWorkers(t *testing.T, want int, when string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		runtime.GC()
-		if lruWorkers() == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: workers=%d, want %d", when, lruWorkers(), want)
-		}
-		time.Sleep(20 * time.Millisecond)
+	t.Logf("live bytes allocated by newSessionTable after %d closed wrappers: %d", n, inuse)
+	// Leaking would retain >= n * ~8 KB = ~1.6 MB.
+	if inuse > 64<<10 {
+		t.Fatalf("%d bytes still live from closed wrappers' session tables", inuse)
 	}
 }

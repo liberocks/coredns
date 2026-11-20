@@ -10,7 +10,6 @@ import (
 
 	clog "github.com/coredns/coredns/plugin/pkg/log"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/pires/go-proxyproto"
 )
 
@@ -63,9 +62,10 @@ type PacketConn struct {
 	// so connections without it skip the extra TLV processing.
 	CaptureTLVs bool
 
-	// sessionCache is a thread-safe expirable LRU; lazily initialized on
-	// first use when UDPSessionTrackingTTL > 0.
-	sessionCache *expirable.LRU[string, *proxyproto.Header]
+	// sessionCache is a thread-safe expiring LRU; lazily initialized on first
+	// use when UDPSessionTrackingTTL > 0. It owns no goroutine, so it is
+	// released with the PacketConn.
+	sessionCache *sessionTable
 }
 
 func (c *PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {

@@ -1,15 +1,13 @@
 package test
 
-// End-to-end reproduction for finding 05: UDP PROXY session cache workers across
-// in-process reloads of a real CoreDNS instance (caddy Restart).
+// End-to-end check that the UDP PROXY session cache leaves no background worker
+// behind across in-process reloads of a real CoreDNS instance (caddy Restart).
 //
-// A "worker" is a goroutine rooted at expirable.NewLRU from the pinned
-// golang-lru/v2 v2.0.7. In this repository the only user of that package is the
-// proxyproto session cache, so each worker is one session cache that has been
-// created by the first tracked session on one PacketConn wrapper.
-//
-// The assertions describe behaviour observed today. Where a fix is expected to
-// change a number, the comment says so.
+// The session cache used to be a golang-lru/v2 expirable.LRU. Its cleanup
+// goroutine (rooted at expirable.NewLRU) could never be stopped, so every
+// listener that had served a tracked session left one worker behind when it was
+// closed, and each reload replaced the listener. lruWorkerCount() counts those
+// goroutines and must stay at zero.
 
 import (
 	"bytes"
@@ -54,7 +52,7 @@ func packetConnOf(t *testing.T, inst *caddy.Instance, k int) (typ string, ptr ui
 		t.Fatal("server has no packet conn")
 	}
 	e := f.Elem()
-	reusable = e.Type().Implements(reflect.TypeOf((*caddy.PacketConn)(nil)).Elem())
+	reusable = e.Type().Implements(reflect.TypeFor[caddy.PacketConn]())
 	return e.Type().String(), e.Pointer(), reusable
 }
 
@@ -107,7 +105,7 @@ func sendTracked(t *testing.T, serverPort int, realClient string) {
 	t.Fatalf("no reply to tracked query: %v", lastErr)
 }
 
-func TestProxyProtoUDPSessionWorkersAcrossReloads(t *testing.T) {
+func TestProxyProtoUDPSessionNoWorkersAcrossReloads(t *testing.T) {
 	const reloads = 5
 	port := pickPort(t)
 	corefile := fmt.Sprintf(`.:%d {
@@ -147,13 +145,12 @@ func TestProxyProtoUDPSessionWorkersAcrossReloads(t *testing.T) {
 		t.Fatal("wrapper has File(); caddy would reuse it and a reload would not replace it")
 	}
 
-	// Lazy start: a listener that has served no tracked session has no worker.
 	if d := delta(); d != 0 {
 		t.Fatalf("workers before any traffic = +%d, want +0", d)
 	}
 	sendTracked(t, port, "198.51.100.1")
-	if d := delta(); d != 1 {
-		t.Fatalf("workers after first tracked session = +%d, want +1", d)
+	if d := delta(); d != 0 {
+		t.Fatalf("workers after first tracked session = +%d, want +0", d)
 	}
 
 	for i := 1; i <= reloads; i++ {
@@ -167,41 +164,27 @@ func TestProxyProtoUDPSessionWorkersAcrossReloads(t *testing.T) {
 		}
 		prev = cur
 
-		// Old listener is closed, new one has served nothing yet: still i workers
-		// (all belonging to closed listeners); expected 0 after a fix.
-		if d := delta(); d != i {
-			t.Fatalf("after reload %d, before traffic: workers=+%d, want +%d", i, d, i)
+		if d := delta(); d != 0 {
+			t.Fatalf("after reload %d, before traffic: workers=+%d, want +0", i, d)
 		}
 		sendTracked(t, port, fmt.Sprintf("198.51.100.%d", i+1))
-		if d := delta(); d != i+1 {
-			t.Fatalf("after reload %d + traffic: workers=+%d, want +%d", i, d, i+1)
+		if d := delta(); d != 0 {
+			t.Fatalf("after reload %d + traffic: workers=+%d, want +0", i, d)
 		}
-		t.Logf("reload %d: 1 live listener, %d session-cache workers (%d belong to closed listeners)", i, delta(), delta()-1)
 	}
 
-	// A reload with no traffic afterwards adds nothing (lazy), but retains all.
-	c, err = c.Restart(NewInput(corefile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d := delta(); d != reloads+1 {
-		t.Fatalf("after idle reload: workers=+%d, want +%d", d, reloads+1)
-	}
-
-	// Waiting past the session TTL expires entries but not workers.
-	time.Sleep(3 * 2 * time.Second)
+	time.Sleep(3 * 2 * time.Second) // well past the session TTL
 	settle()
-	if d := delta(); d != reloads+1 {
-		t.Fatalf("after 3xTTL: workers=+%d, want +%d", d, reloads+1)
+	if d := delta(); d != 0 {
+		t.Fatalf("after 3xTTL: workers=+%d, want +0", d)
 	}
 
 	c.Stop()
 	stopped = true
 	settle()
-	if d := delta(); d != reloads+1 {
-		t.Fatalf("after final Stop: workers=+%d, want +%d (expected +0 after a fix)", d, reloads+1)
+	if d := delta(); d != 0 {
+		t.Fatalf("after final Stop: workers=+%d, want +0", d)
 	}
-	t.Logf("after final Stop with NO live listener: %d session-cache workers remain", delta())
 }
 
 // Controls: reloads of listeners that are not eligible create no workers.
