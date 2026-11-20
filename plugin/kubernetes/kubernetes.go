@@ -246,12 +246,43 @@ func (k *Kubernetes) getClientConfig() (*rest.Config, error) {
 	return cc, err
 }
 
+// applyAPIThrottling sets apiserver_qps, apiserver_burst and apiserver_max_inflight on config.
+// It must run before any client is built from config: client-go copies the config and creates the
+// rate limiter and the HTTP transport when a client is constructed, so later changes are ignored.
+func (k *Kubernetes) applyAPIThrottling(config *rest.Config) {
+	if k.apiQPS > 0 {
+		config.QPS = k.apiQPS
+	}
+
+	if k.apiBurst > 0 {
+		config.Burst = k.apiBurst
+	}
+
+	// client-go refuses to build a client with a QPS and no burst. Use its default burst
+	// when only apiserver_qps is set.
+	if k.apiQPS > 0 && config.Burst <= 0 {
+		config.Burst = rest.DefaultBurst
+	}
+
+	if k.apiMaxInflight > 0 {
+		existingWrap := config.WrapTransport
+		config.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
+			if existingWrap != nil {
+				rt = existingWrap(rt)
+			}
+			return newMaxInflightRoundTripper(rt, k.apiMaxInflight)
+		}
+	}
+}
+
 // InitKubeCache initializes a new Kubernetes cache.
 func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, onShut func() error, err error) {
 	config, err := k.getClientConfig()
 	if err != nil {
 		return nil, nil, err
 	}
+
+	k.applyAPIThrottling(config)
 
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -282,24 +313,6 @@ func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, o
 			return nil, nil, fmt.Errorf("unable to create Selector for LabelSelector '%s': %q", k.opts.namespaceLabelSelector, err)
 		}
 		k.opts.namespaceSelector = selector
-	}
-
-	if k.apiQPS > 0 {
-		config.QPS = k.apiQPS
-	}
-
-	if k.apiBurst > 0 {
-		config.Burst = k.apiBurst
-	}
-
-	if k.apiMaxInflight > 0 {
-		existingWrap := config.WrapTransport
-		config.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
-			if existingWrap != nil {
-				rt = existingWrap(rt)
-			}
-			return newMaxInflightRoundTripper(rt, k.apiMaxInflight)
-		}
 	}
 
 	k.opts.initPodCache = k.podMode == podModeVerified
