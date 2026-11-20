@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -247,8 +248,13 @@ func newAnsweringServer(t *testing.T) string {
 // TestPlainTCPDialTimeoutStates walks the adaptive plain TCP dial timeout
 // through the states a transport can be in, using the same functions
 // Transport.dial uses (dialTimeout / updateDialTimeout, which dial calls even
-// when the dial failed). The dial timeout is compared with the 5s forwarding
-// window; the dial itself only sees the caller's context, never that window.
+// when the dial failed).
+//
+// The adaptive timeout itself can exceed the 5s forwarding window (a fresh
+// transport starts at the 30s ceiling). That is acceptable only because
+// Forward.ServeDNS gives every attempt a context that ends with the window and
+// net.Dialer uses the earlier of the context deadline and its own timeout.
+// TestForwardBlackholedTCPDial in plugin/forward checks that with a real dial.
 func TestPlainTCPDialTimeoutStates(t *testing.T) {
 	const forwardWindow = 5 * time.Second // forward.defaultTimeout
 
@@ -264,36 +270,96 @@ func TestPlainTCPDialTimeoutStates(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name        string
-		prepare     func(tr *Transport)
-		wantWithin  bool // does the resulting dial timeout fit the forwarding window?
-		explanation string
+		name       string
+		prepare    func(tr *Transport)
+		want       time.Duration
+		aboveFloor bool // the dial timeout is expected to exceed the forwarding window
 	}{
-		{"fresh transport, no dial finished yet", func(*Transport) {}, false,
-			"avgDialTime starts at maxDialTimeout/2, which limitTimeout maps to the 30s ceiling"},
-		{"fresh transport, upstream blackholed (every dial times out)", func(tr *Transport) { fail(tr, 200) }, false,
-			"nothing ever succeeds to pull the average down, so the 30s ceiling is kept"},
-		{"warmed by healthy dials", func(tr *Transport) { healthy(tr, 50) }, true,
-			"the floor is 1s"},
-		{"warmed, then upstream blackholed", func(tr *Transport) { healthy(tr, 50); fail(tr, 200) }, true,
-			"failed dials move the average toward the floor-limited timeout, not past it: no escalation"},
-		{"degraded upstream, dials legitimately take 3s", func(tr *Transport) {
-			for range 50 {
-				tr.updateDialTimeout(3 * time.Second)
-			}
-		}, false, "timeout is twice the average, so a 2.5s average already exceeds the window"},
+		{"fresh transport, no dial finished yet", func(*Transport) {}, maxDialTimeout, true},
+		{"fresh transport, upstream blackholed (every dial times out)", func(tr *Transport) { fail(tr, 200) }, maxDialTimeout, true},
+		{"warmed by healthy dials", func(tr *Transport) { healthy(tr, 50) }, minDialTimeout, false},
+		// Failed dials move the average toward the floor-limited timeout, not past it: no escalation.
+		{"warmed, then upstream blackholed", func(tr *Transport) { healthy(tr, 50); fail(tr, 200) }, minDialTimeout, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := newTransport("forward", "192.0.2.1:53")
 			tc.prepare(tr)
 			got := tr.dialTimeout()
-			t.Logf("dial timeout = %v (window %v): %s", got, forwardWindow, tc.explanation)
-			if (got <= forwardWindow) != tc.wantWithin {
-				t.Fatalf("dial timeout %v: within window = %v, want %v", got, got <= forwardWindow, tc.wantWithin)
+			t.Logf("dial timeout = %v (forwarding window %v)", got, forwardWindow)
+			if got != tc.want {
+				t.Fatalf("dial timeout = %v, want %v", got, tc.want)
 			}
-			if !tc.wantWithin {
-				t.Errorf("plain TCP dial may block for %v, longer than the %v forwarding window", got, forwardWindow)
+			if (got > forwardWindow) != tc.aboveFloor {
+				t.Fatalf("dial timeout %v: above window = %v, want %v", got, got > forwardWindow, tc.aboveFloor)
 			}
 		})
+	}
+
+	// A degraded upstream whose dials really take 3s gets twice that as its timeout.
+	t.Run("degraded upstream, dials legitimately take 3s", func(t *testing.T) {
+		tr := newTransport("forward", "192.0.2.1:53")
+		for range 50 {
+			tr.updateDialTimeout(3 * time.Second)
+		}
+		if got := tr.dialTimeout(); got <= forwardWindow {
+			t.Fatalf("dial timeout = %v, want more than the %v window", got, forwardWindow)
+		}
+	})
+}
+
+func cachedConns(p *Proxy) int {
+	p.transport.mu.Lock()
+	defer p.transport.mu.Unlock()
+	n := 0
+	for _, conns := range p.transport.conns {
+		n += len(conns)
+	}
+	return n
+}
+
+// A connection whose exchange was cut short by the caller must be closed, not
+// cached: a late reply could otherwise be read by the next request.
+func TestInterruptedConnectionIsNotCached(t *testing.T) {
+	for _, proto := range []string{"udp", "tcp"} {
+		t.Run(proto, func(t *testing.T) {
+			up := newSilentUpstream(t, proto)
+			p := NewProxy("forward", up.addr, transport.DNS)
+			p.SetReadTimeout(upstreamReadTimeout)
+			t.Cleanup(func() { p.transport.cleanup(true) })
+
+			ctx, cancel := context.WithTimeout(t.Context(), callerBudget)
+			defer cancel()
+			msg := new(dns.Msg)
+			msg.SetQuestion("example.org.", dns.TypeA)
+			_, _, _, err := p.Connect(ctx, request.Request{Req: msg, W: &test.ResponseWriter{TCP: proto == "tcp"}}, Options{ForceTCP: proto == "tcp"})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Connect error = %v, want it to wrap %v", err, context.DeadlineExceeded)
+			}
+			if n := cachedConns(p); n != 0 {
+				t.Fatalf("%d connection(s) cached after an interrupted exchange", n)
+			}
+		})
+	}
+}
+
+// Control: a normal exchange still returns its connection to the cache and the
+// next request reuses it.
+func TestCompletedConnectionIsReused(t *testing.T) {
+	server := newAnsweringServer(t)
+	p := NewProxy("forward", server, transport.DNS)
+	t.Cleanup(func() { p.transport.cleanup(true) })
+
+	for i := range 2 {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*callerBudget)
+		msg := new(dns.Msg)
+		msg.SetQuestion("example.org.", dns.TypeA)
+		_, _, _, err := p.Connect(ctx, request.Request{Req: msg, W: &test.ResponseWriter{TCP: true}}, Options{ForceTCP: true})
+		cancel()
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		if n := cachedConns(p); n != 1 {
+			t.Fatalf("after request %d: %d cached connection(s), want 1", i, n)
+		}
 	}
 }

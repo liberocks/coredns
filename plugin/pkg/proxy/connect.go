@@ -186,7 +186,18 @@ func (p *Proxy) lookupDNS(ctx context.Context, state request.Request, opts Optio
 	// Set buffer size correctly for this client.
 	pc.c.UDPSize = max(uint16(state.Size()), 512) // #nosec G115 -- UDP size fits in uint16
 
-	pc.c.SetWriteDeadline(time.Now().Add(maxTimeout))
+	// Interrupt a pending write or read as soon as ctx ends. Its deadline, if any,
+	// also caps the socket deadlines below, so the exchange never outlives the caller.
+	stop := context.AfterFunc(ctx, func() { pc.c.SetDeadline(time.Now()) })
+	defer stop()
+
+	// The deadline set below can overwrite the one the AfterFunc sets when ctx ends
+	// first, so ctx is checked again after each one.
+	pc.c.SetWriteDeadline(deadlineWithin(ctx, maxTimeout))
+	if err = ctx.Err(); err != nil {
+		pc.c.Close() // not giving it back
+		return nil, localAddr, proto, err
+	}
 	if wire != nil {
 		_, err = pc.c.Write(wire)
 	} else {
@@ -197,11 +208,15 @@ func (p *Proxy) lookupDNS(ctx context.Context, state request.Request, opts Optio
 		if err == io.EOF && cached {
 			return nil, localAddr, proto, ErrCachedClosed
 		}
-		return nil, localAddr, proto, err
+		return nil, localAddr, proto, ctxError(ctx, err)
 	}
 
 	var ret *dns.Msg
-	pc.c.SetReadDeadline(time.Now().Add(p.readTimeout))
+	pc.c.SetReadDeadline(deadlineWithin(ctx, p.readTimeout))
+	if err = ctx.Err(); err != nil {
+		pc.c.Close() // not giving it back
+		return nil, localAddr, proto, err
+	}
 	for {
 		ret, err = pc.c.ReadMsg()
 		if err != nil {
@@ -231,16 +246,51 @@ func (p *Proxy) lookupDNS(ctx context.Context, state request.Request, opts Optio
 			if ret != nil {
 				ret.Id = originId
 			}
-			return ret, localAddr, proto, err
+			return ret, localAddr, proto, ctxError(ctx, err)
 		}
 		// drop out-of-order responses
 		if state.Req.Id == ret.Id {
 			break
 		}
 	}
+	// If stop reports false, ctx ended and the AfterFunc has run or is running. It may
+	// have put a past deadline on the connection, so the connection must not be reused.
+	if !stop() {
+		pc.c.Close()
+		return ret, localAddr, proto, nil
+	}
 	p.transport.Yield(pc)
 
 	return ret, localAddr, proto, nil
+}
+
+// deadlineWithin returns now+d, or the deadline of ctx if that comes first.
+func deadlineWithin(ctx context.Context, d time.Duration) time.Time {
+	t := time.Now().Add(d)
+	if cd, ok := ctx.Deadline(); ok && cd.Before(t) {
+		return cd
+	}
+	return t
+}
+
+// ctxError reports the context's error together with err when ctx ended and err is
+// the resulting I/O timeout, so callers can tell a caller deadline from a slow upstream.
+func ctxError(ctx context.Context, err error) error {
+	cerr := ctx.Err()
+	if cerr == nil {
+		// The socket deadline is the context deadline, so the read can time out an instant
+		// before the context's own timer marks it done.
+		if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
+			cerr = context.DeadlineExceeded
+		}
+	}
+	if cerr != nil && !errors.Is(err, cerr) {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return fmt.Errorf("%w: %w", cerr, err)
+		}
+	}
+	return err
 }
 
 func (p *Proxy) lookupDoH(ctx context.Context, state request.Request, _ Options) (*dns.Msg, net.Addr, string, error) {
