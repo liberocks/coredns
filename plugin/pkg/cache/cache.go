@@ -6,6 +6,7 @@ package cache
 import (
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 )
 
 // Hash returns the FNV hash of what.
@@ -18,12 +19,19 @@ func Hash(what []byte) uint64 {
 // Cache is cache.
 type Cache[T any] struct {
 	shards [shardSize]*shard[T]
+
+	// total is the number of elements across all shards. Each shard updates it
+	// while holding its own lock, so Len does not need to lock every shard.
+	total atomic.Int64
 }
 
 // shard is a cache with random eviction.
 type shard[T any] struct {
 	items map[uint64]T
 	size  int
+
+	// total is the owning Cache's element counter. It is nil for a standalone shard.
+	total *atomic.Int64
 
 	sync.RWMutex
 }
@@ -37,6 +45,7 @@ func New[T any](size int) *Cache[T] {
 	// Initialize all the shards
 	for i := range shardSize {
 		c.shards[i] = newShard[T](ssize)
+		c.shards[i].total = &c.total
 	}
 	return c
 }
@@ -60,13 +69,10 @@ func (c *Cache[T]) Remove(key uint64) {
 	c.shards[shard].Remove(key)
 }
 
-// Len returns the number of elements in the cache.
+// Len returns the number of elements in the cache. It reads a maintained
+// counter and takes no shard locks, so it is cheap enough to call on hot paths.
 func (c *Cache[T]) Len() int {
-	l := 0
-	for _, s := range &c.shards {
-		l += s.Len()
-	}
-	return l
+	return int(c.total.Load())
 }
 
 // Walk walks each shard in the cache.
@@ -84,6 +90,7 @@ func newShard[T any](size int) *shard[T] { return &shard[T]{items: make(map[uint
 func (s *shard[T]) Add(key uint64, el T) bool {
 	eviction := false
 	s.Lock()
+	before := len(s.items)
 	if len(s.items) >= s.size {
 		if _, ok := s.items[key]; !ok {
 			for k := range s.items {
@@ -94,6 +101,7 @@ func (s *shard[T]) Add(key uint64, el T) bool {
 		}
 	}
 	s.items[key] = el
+	s.count(len(s.items) - before)
 	s.Unlock()
 	return eviction
 }
@@ -101,7 +109,9 @@ func (s *shard[T]) Add(key uint64, el T) bool {
 // Remove removes the element indexed by key from the cache.
 func (s *shard[T]) Remove(key uint64) {
 	s.Lock()
+	before := len(s.items)
 	delete(s.items, key)
+	s.count(len(s.items) - before)
 	s.Unlock()
 }
 
@@ -110,9 +120,18 @@ func (s *shard[T]) Evict() {
 	s.Lock()
 	for k := range s.items {
 		delete(s.items, k)
+		s.count(-1)
 		break
 	}
 	s.Unlock()
+}
+
+// count adds delta to the owning cache's element counter. The caller holds the
+// shard's write lock.
+func (s *shard[T]) count(delta int) {
+	if s.total != nil && delta != 0 {
+		s.total.Add(int64(delta))
+	}
 }
 
 // Get looks up the element indexed under key.
@@ -132,6 +151,7 @@ func (s *shard[T]) Len() int {
 }
 
 // Walk walks the shard for each element the function f is executed while holding a write lock.
+// f may delete elements from the map it is given; the cache's element count follows.
 func (s *shard[T]) Walk(f func(map[uint64]T, uint64) bool) {
 	s.RLock()
 	items := make([]uint64, len(s.items))
@@ -143,7 +163,9 @@ func (s *shard[T]) Walk(f func(map[uint64]T, uint64) bool) {
 	s.RUnlock()
 	for _, k := range items {
 		s.Lock()
+		before := len(s.items)
 		ok := f(s.items, k)
+		s.count(len(s.items) - before)
 		s.Unlock()
 		if !ok {
 			return
